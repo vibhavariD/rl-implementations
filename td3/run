@@ -1,0 +1,158 @@
+#! /usr/bin/env python3
+
+import numpy as np, torch, torch.nn as nn, sys, gym, copy, random, collections, tensorboardX
+from termcolor import colored
+
+#==============================================================================
+# PARAMETERS
+
+ENV           = 'HalfCheetah-v2'
+EPISODES      = int(1e8)
+LR            = 1e-3
+TRAIN_STEPS   = 1
+SIG_ACT       = 0.1
+SIG_TRAIN     = 0.2
+EXPLORE_STEPS = 10000
+BATCH         = 100
+C             = 0.5
+D             = 2
+TAU           = 5e-3
+GAMMA         = 0.99
+VIZ_STEP      = int(1)
+VIZ           = False
+
+#==============================================================================
+# SETUP
+
+env = gym.make(ENV)
+obs_size = env.observation_space.shape[0]
+act_size = env.action_space.shape[0]
+
+Exp = collections.namedtuple('Exp', ('obs', 'act', 'rew', 'nobs', 'done'))
+
+timestep  = 0
+buf       = []
+writer    = tensorboardX.SummaryWriter()
+
+#==============================================================================
+# MODEL
+
+class CriticNetwork(nn.Module):
+  def __init__(self, obs_size, act_size):
+    super(CriticNetwork, self).__init__()
+    self.c1 = nn.Sequential(nn.Linear(obs_size+act_size, 400), nn.ReLU())
+    self.c2 = nn.Sequential(nn.Linear(act_size+400, 300), nn.ReLU(), nn.Linear(300, 1))
+
+  def forward(self, obs, act):
+    x = self.c1(torch.cat([obs, act], dim=1))
+    return self.c2(torch.cat([x, act], dim=1))
+
+#------------------------------------------------------------------------------
+
+class ActorNetwork(nn.Module):
+  def __init__(self, obs_size, act_size):
+    super(ActorNetwork, self).__init__()
+    self.a1 = nn.Sequential(nn.Linear(obs_size, 400), nn.ReLU(), nn.Linear(400, 300), nn.ReLU(), nn.Linear(300, act_size), nn.Tanh())
+
+  def forward(self, obs):
+    return self.a1(obs)
+
+#------------------------------------------------------------------------------
+
+q1 = CriticNetwork(obs_size, act_size).cuda()
+q2 = CriticNetwork(obs_size, act_size).cuda()
+pi = ActorNetwork (obs_size, act_size).cuda()
+
+opt_c = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=LR)
+opt_a = torch.optim.Adam(pi.parameters(), lr=LR)
+
+tq1 = copy.deepcopy(q1).cuda()
+tq2 = copy.deepcopy(q2).cuda()
+tpi = copy.deepcopy(pi).cuda()
+
+#==============================================================================
+# FUNCTIONS
+
+def select_action(obs):
+  if timestep < EXPLORE_STEPS: return np.clip(env.action_space.sample(), -1, 1)
+  act = pi(torch.as_tensor(obs).float().cuda()).detach().cpu().numpy()
+  act = np.clip(act + np.random.normal(0, SIG_ACT), -1.0, 1.0)
+  return act
+
+#------------------------------------------------------------------------------
+
+def episode():
+  global timestep
+  obs  = env.reset()
+  done = False
+  rewards = 0
+  while not done:
+    act = select_action(obs)
+    nobs, rew, done, _ = env.step(act)
+    buf.append(Exp(obs, act, rew, nobs, done))
+    rewards += rew
+
+    for step in range(TRAIN_STEPS):
+      losses = train(buf)
+
+    for k,v in losses.items():
+      writer.add_scalar('{}/{}'.format(ENV,k), v, timestep)
+
+    obs = nobs.copy()
+    timestep += 1
+    if VIZ and (timestep > VIZ_STEP): env.render()
+  return rewards
+
+#------------------------------------------------------------------------------
+
+def train(buf):
+  if timestep < EXPLORE_STEPS: return {}
+
+  batch = random.sample(buf, BATCH)
+  batch = Exp(*map(lambda x: torch.FloatTensor(x).view(BATCH, -1).cuda(), zip(*batch)))
+
+  nact  = tpi(batch.nobs)
+  noise = torch.clamp(torch.randn(BATCH, act_size)*SIG_TRAIN, -C, C).cuda()
+  nact  = torch.clamp(nact + noise, -1.0, 1.0)
+
+  qn1 = tq1(batch.nobs, nact)
+  qn2 = tq2(batch.nobs, nact)
+  qn  = torch.min(qn1, qn2)
+
+  qs1 = q1(batch.obs, batch.act)
+  qs2 = q2(batch.obs, batch.act)
+
+  # train critic
+  target  = batch.rew + GAMMA * qn * (1-batch.done)
+  loss_q1 = torch.mean((target.detach() - qs1)**2)
+  loss_q2 = torch.mean((target.detach() - qs2)**2)
+
+  loss_c  = loss_q1 + loss_q2
+
+  opt_c.zero_grad()
+  loss_c.backward()
+  opt_c.step()
+
+  # train actor
+  loss_a = torch.zeros(1)
+  if timestep % D == 0:
+    loss_a = torch.mean(-q1(batch.obs, pi(batch.obs)))
+    opt_a.zero_grad()
+    loss_a.backward()
+    opt_a.step()
+
+  for po,pt in zip(q1.parameters(), tq1.parameters()):
+    pt.data = pt.data * (1 - TAU) + po.data * TAU
+  for po,pt in zip(q2.parameters(), tq2.parameters()):
+    pt.data = pt.data * (1 - TAU) + po.data * TAU
+  for po,pt in zip(pi.parameters(), tpi.parameters()):
+    pt.data = pt.data * (1 - TAU) + po.data * TAU
+
+  return {'loss_c':loss_c.item(), 'loss_a':loss_a.item()}
+
+#==============================================================================
+# RUN
+
+for ep in range(EPISODES):
+  rewards = episode()
+  writer.add_scalar('{}/rewards'.format(ENV), rewards, ep)
